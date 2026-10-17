@@ -1,0 +1,4 @@
+# Skill bundles are packed into reproducible archives whose SHA-256 is pinned in
+# marketplace entries, so their bytes must not depend on the checkout host.
+# Path.read_text()/write_text() round trips rewrite LF files as CRLF on Windows.
+* text=auto eol=lf

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-skill:
+    name: Validate skills and run smoke tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dcc-mcp-core
+        run: python -m pip install --disable-pip-version-check "dcc-mcp-core>=0.19"
+
+      - name: Report core version
+        run: python -c "import dcc_mcp_core; print('dcc_mcp_core', dcc_mcp_core.__version__)"
+
+      - name: Run smoke tests
+        run: python tests/smoke_test.py
+
+  python37-syntax:
+    name: Python 3.7 syntax gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.7"
+
+      # The skill scripts must stay importable on Python 3.7, which is the
+      # organization's red line. Compiling is the check: a syntax error here is
+      # a hard failure, and no runtime dependency is needed to detect it.
+      - name: Compile skill scripts on Python 3.7
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import py_compile
+          import sys
+
+          print("python", sys.version)
+          files = sorted(pathlib.Path("skill").rglob("*.py"))
+          if not files:
+              raise SystemExit("no skill scripts found")
+          for path in files:
+              py_compile.compile(str(path), doraise=True, cfile=str(path) + "c")
+              print("py37 compile OK:", path)
+          PY
+
+      - name: Run smoke tests on Python 3.7
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "dcc-mcp-core>=0.19"
+          python tests/smoke_test.py
