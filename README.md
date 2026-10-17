@@ -21,7 +21,11 @@ machine's current script execution policy:
 # Linux/macOS
 curl -fL https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-core/main/scripts/install-cli.sh -o install-cli.sh
 cat install-cli.sh
-# After reviewing the file:
+```
+
+After inspecting the file and obtaining the user's permission to install, run:
+
+```bash
 sh ./install-cli.sh
 ```
 
@@ -29,7 +33,12 @@ sh ./install-cli.sh
 # Windows PowerShell
 Invoke-WebRequest https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-core/main/scripts/install-cli.ps1 -OutFile .\install-cli.ps1
 Get-Content -Raw .\install-cli.ps1
-# After reviewing the file and subject to the current execution policy:
+```
+
+After inspecting the file and obtaining the user's permission to install,
+run under the current Windows execution policy:
+
+```powershell
 & .\install-cli.ps1
 ```
 
@@ -37,7 +46,12 @@ Keep an official build current through the release manifest:
 
 ```bash
 dcc-mcp-cli update check
-# Only after the user explicitly agrees to the update:
+```
+
+After reviewing the result and obtaining the user's explicit agreement to
+the update, run:
+
+```bash
 dcc-mcp-cli update apply --yes
 ```
 
