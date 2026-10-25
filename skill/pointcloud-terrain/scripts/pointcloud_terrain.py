@@ -99,7 +99,11 @@ def main(
         if not filename:
             filename = "%s.laz" % (summary["source_id"] or "tile")
         local_path = os.path.join(output_dir, filename)
-        download_tile(summary["download_url"], local_path)
+        download_tile(
+            summary["download_url"],
+            local_path,
+            expected_size=summary["size_in_bytes"],
+        )
         return skill_success(
             "USGS 3DEP point cloud tile downloaded",
             files=[local_path],

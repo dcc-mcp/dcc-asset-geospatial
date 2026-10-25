@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -189,6 +190,54 @@ def pointcloud_terrain_guards_smoke() -> None:
     assert {"success", "message", "context"} <= set(envelope), sorted(envelope)
     assert envelope["context"]["candidate_count"] == 1
     assert envelope["context"]["bbox"] == [39.7, -105.6, 39.703, -105.595]
+
+    # TNM pages its results; every page must be walked so a tile beyond the
+    # first page is still selectable, and the scan stays bounded.
+    def fake_tile(index):
+        return {
+            "title": "tile %03d" % index,
+            "sourceId": "%03d" % index,
+            "downloadURL": "https://rockyweb.usgs.gov/%03d.laz" % index,
+            "urls": {"LAZ": "https://rockyweb.usgs.gov/%03d.laz" % index},
+        }
+
+    pages = [
+        {"total": 150, "items": [fake_tile(i) for i in range(100)]},
+        {"total": 150, "items": [fake_tile(i) for i in range(100, 150)]},
+    ]
+    requested = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self, *_args):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def fake_open(url, timeout, headers=None):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        requested.append((query["max"][0], query["offset"][0]))
+        page = pages[0] if query["offset"][0] == "0" else pages[1]
+        return FakeResponse(json.dumps(page).encode("utf-8"))
+
+    with patch.object(helper, "open_allowed_url", fake_open):
+        candidates = helper.query_candidates(helper.validate_bbox(39.70, -105.60, 39.703, -105.595))
+    assert requested == [("100", "0"), ("100", "100")], requested
+    assert len(candidates) == 25, len(candidates)
+    assert candidates[0]["sourceId"] == "000", candidates[0]
+
+    # A download falls back to the published TNM size when the response has no
+    # usable Content-Length.
+    assert helper._resolve_expected_size("12", 99) == 12
+    assert helper._resolve_expected_size(None, 48093708) == 48093708
+    assert helper._resolve_expected_size("bogus", 48093708) == 48093708
+    assert helper._resolve_expected_size(None, None) is None
 
     # A truncated or non-LAZ payload must never be accepted as a tile.
     with tempfile.TemporaryDirectory() as tmp:

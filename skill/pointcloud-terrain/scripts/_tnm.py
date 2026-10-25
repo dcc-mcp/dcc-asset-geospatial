@@ -29,6 +29,12 @@ TEMP_SUFFIX = ".part"
 MAX_BBOX_AREA_SQ_DEG = 0.04
 MAX_CANDIDATES = 25
 
+# TNM pages its product results: ``max`` must be a multiple of 5 and at most
+# 1000. A query walks pages until the reported ``total`` is covered or the scan
+# cap is reached, so a candidate on a later page is never silently dropped.
+PAGE_SIZE = 100
+MAX_SCANNED_ITEMS = 500
+
 LPC_PUBLIC_DOMAIN = (
     "Unless otherwise noted, data and publications on the USGS Science Data Catalog are "
     "in the public domain and may be used without permission, though USGS asks for credit."
@@ -95,6 +101,8 @@ def build_query_url(
     bbox: tuple,
     endpoint: str = DEFAULT_ENDPOINT,
     dataset: str = DATASET,
+    page_size: int = None,
+    offset: int = None,
 ) -> str:
     """Build a bounded TNM products query URL for ``bbox``."""
     south, west, north, east = bbox
@@ -102,6 +110,10 @@ def build_query_url(
         ("datasets", dataset),
         ("bbox", "%s,%s,%s,%s" % (west, south, east, north)),
     ]
+    if page_size is not None:
+        params.append(("max", str(page_size)))
+    if offset is not None:
+        params.append(("offset", str(offset)))
     return endpoint + "?" + urllib.parse.urlencode(params)
 
 
@@ -109,17 +121,30 @@ def query_candidates(bbox: tuple, endpoint: str = DEFAULT_ENDPOINT, timeout: flo
     """Return the bounded, deterministic LAZ candidate list for ``bbox``.
 
     Only tiles that publish a real ``.laz`` URL are returned, so a chosen tile
-    can always be reported as ``format: laz`` without guessing. The list is
-    sorted by ``(title, sourceId)`` so repeated queries for the same bbox
-    return the same ordering regardless of upstream response order.
+    can always be reported as ``format: laz`` without guessing. Every result
+    page is walked up to ``MAX_SCANNED_ITEMS`` so a tile on a later page is not
+    dropped, and the surviving candidates are sorted by ``(title, sourceId)``
+    so repeated queries for the same bbox return the same ordering regardless
+    of upstream response order.
     """
+    endpoint = ensure_allowed_url(endpoint)
     request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    url = build_query_url(bbox, ensure_allowed_url(endpoint))
-    with open_allowed_url(url, timeout, headers=request_headers) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    items = [item for item in (payload.get("items") or []) if laz_download_url(item)]
+    items = []
+    offset = 0
+    while len(items) < MAX_SCANNED_ITEMS:
+        url = build_query_url(bbox, endpoint, page_size=PAGE_SIZE, offset=offset)
+        with open_allowed_url(url, timeout, headers=request_headers) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        page = payload.get("items") or []
+        items.extend(page)
+        offset += len(page)
+        total = payload.get("total")
+        if not page or len(page) < PAGE_SIZE:
+            break
+        if isinstance(total, int) and offset >= min(total, MAX_SCANNED_ITEMS):
+            break
     return sorted(
-        items,
+        (item for item in items if laz_download_url(item)),
         key=lambda item: (str(item.get("title") or ""), str(item.get("sourceId") or "")),
     )[:MAX_CANDIDATES]
 
@@ -207,32 +232,49 @@ def verify_laz_payload(path: str, expected_size: int = None) -> int:
     return actual_size
 
 
-def download_tile(url: str, destination: str, chunk_size: int = 1 << 20, timeout: float = 600.0) -> str:
+def download_tile(
+    url: str,
+    destination: str,
+    chunk_size: int = 1 << 20,
+    timeout: float = 600.0,
+    expected_size: Any = None,
+) -> str:
     """Stream an allowlisted LAZ tile to ``destination`` and return its path.
 
     The payload is written to a sidecar ``.part`` file and only moved into place
-    after the byte count matches ``Content-Length`` and the LAZ signature is
-    present, so an early EOF or an HTML error page can never be published as a
-    successful tile.
+    after the byte count matches ``Content-Length`` — or, when the response does
+    not report one, the size published by TNM — and the LAZ signature is
+    present. An early EOF or an HTML error page therefore fails instead of being
+    published as a successful tile.
     """
     ensure_allowed_url(url)
     temp_path = destination + TEMP_SUFFIX
     try:
         with open_allowed_url(url, timeout) as response:
-            expected_size = _parse_content_length(response.headers.get("Content-Length"))
+            resolved_size = _resolve_expected_size(
+                response.headers.get("Content-Length"), expected_size
+            )
             with open(temp_path, "wb") as handle:
                 while True:
                     chunk = response.read(chunk_size)
                     if not chunk:
                         break
                     handle.write(chunk)
-        verify_laz_payload(temp_path, expected_size)
+        verify_laz_payload(temp_path, resolved_size)
         os.replace(temp_path, destination)
     except Exception:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise
     return destination
+
+
+def _resolve_expected_size(content_length: Any, fallback: Any) -> Optional[int]:
+    """Prefer the response ``Content-Length``, falling back to the TNM size."""
+    parsed = _parse_content_length(content_length)
+    if parsed is not None:
+        return parsed
+    return _parse_content_length(fallback)
 
 
 def _parse_content_length(value: Any) -> Optional[int]:
