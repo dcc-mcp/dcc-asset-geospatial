@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -102,11 +105,119 @@ def pointcloud_terrain_smoke() -> None:
     assert descriptor["attribution"]["source_url"] == "https://www.usgs.gov/3d-elevation-program"
 
 
+def pointcloud_terrain_guards_smoke() -> None:
+    from dcc_mcp_core import parse_skill_md
+
+    helper = load("pointcloud-terrain", "_tnm")
+    module = load("pointcloud-terrain", "pointcloud_terrain")
+    skill_dir = ROOT / "skill" / "pointcloud-terrain"
+
+    # Declared tool group: tools.yaml assigns both tools to `geospatial`, so the
+    # group must be declared or the tools load behind an undeclared group.
+    meta = parse_skill_md(str(skill_dir))
+    declared_groups = {
+        group["name"] if isinstance(group, dict) else group.name for group in meta.groups
+    }
+    assert declared_groups == {"geospatial"}, declared_groups
+
+    # Declared output_schema must describe the skill_success envelope: the
+    # payload lives under context, and `success` is the only required key.
+    # Declared output_schema must describe the skill_success envelope: the
+    # payload lives under context, and `success` is the only required key.
+    expected_context_keys = {
+        "search_pointcloud_terrain": "candidate_count",
+        "download_pointcloud_terrain": "asset_descriptor",
+    }
+    declared_tools = set()
+    for tool in meta.tools:
+        schema = tool.output_schema
+        if isinstance(schema, str):
+            schema = json.loads(schema)
+        schema = schema or {}
+        assert schema.get("required") == ["success"], (tool.name, schema.get("required"))
+        context_props = (((schema.get("properties") or {}).get("context") or {}).get("properties")) or {}
+        assert expected_context_keys[tool.name] in context_props, (tool.name, sorted(context_props))
+        declared_tools.add(tool.name)
+    assert declared_tools == set(expected_context_keys), declared_tools
+
+    # Only allowlisted USGS hosts may be reached, and only over HTTPS.
+    for rejected in (
+        "http://tnmaccess.nationalmap.gov/api/v1/products",
+        "https://internal.example.com/api/v1/products",
+        "https://tnmaccess.nationalmap.gov.evil.test/api/v1/products",
+        "ftp://rockyweb.usgs.gov/tile.laz",
+        "https://user:secret@rockyweb.usgs.gov/tile.laz",
+        "https://tnmaccess.nationalmap.gov:8443/api/v1/products",
+    ):
+        try:
+            helper.ensure_allowed_url(rejected)
+            raise AssertionError("%r must be rejected" % rejected)
+        except helper.UrlNotAllowedError:
+            pass
+    helper.ensure_allowed_url(helper.DEFAULT_ENDPOINT)
+    helper.ensure_allowed_url("https://rockyweb.usgs.gov/tile.laz")
+
+    # Only tiles that publish a real .laz URL may be reported as format: laz.
+    laz_tile = {
+        "title": "laz tile",
+        "sourceId": "1",
+        "downloadURL": "https://rockyweb.usgs.gov/a.laz",
+        "urls": {"LAZ": "https://rockyweb.usgs.gov/a.laz"},
+    }
+    las_tile = {
+        "title": "las tile",
+        "sourceId": "2",
+        "downloadURL": "https://rockyweb.usgs.gov/b.las",
+        "urls": {"LAS": "https://rockyweb.usgs.gov/b.las"},
+    }
+    assert helper.laz_download_url(laz_tile) == "https://rockyweb.usgs.gov/a.laz"
+    assert helper.laz_download_url(las_tile) == ""
+    assert helper.summarize(laz_tile)["format"] == "laz"
+    assert helper.summarize(las_tile)["format"] == ""
+
+    # The search tool answers with the envelope the schema describes.
+    import pointcloud_terrain as pt  # scripts dir is already on sys.path
+
+    original_query = pt.query_candidates
+    pt.query_candidates = lambda bbox, endpoint=helper.DEFAULT_ENDPOINT, timeout=0: [laz_tile]
+    try:
+        search_tool = load("pointcloud-terrain", "search_pointcloud_terrain")
+        envelope = search_tool.main(south=39.70, west=-105.60, north=39.703, east=-105.595)
+    finally:
+        pt.query_candidates = original_query
+    assert envelope["success"] is True, envelope
+    assert {"success", "message", "context"} <= set(envelope), sorted(envelope)
+    assert envelope["context"]["candidate_count"] == 1
+    assert envelope["context"]["bbox"] == [39.7, -105.6, 39.703, -105.595]
+
+    # A truncated or non-LAZ payload must never be accepted as a tile.
+    with tempfile.TemporaryDirectory() as tmp:
+        good = os.path.join(tmp, "tile.laz")
+        with open(good, "wb") as handle:
+            handle.write(b"LASF" + b"\x00" * 8)
+        assert helper.verify_laz_payload(good, 12) == 12
+        for size in (11, 13):
+            try:
+                helper.verify_laz_payload(good, size)
+                raise AssertionError("size mismatch (%d) must be rejected" % size)
+            except ValueError:
+                pass
+        html_page = os.path.join(tmp, "error.html")
+        with open(html_page, "wb") as handle:
+            handle.write(b"<html>Service Unavailable</html>")
+        try:
+            helper.verify_laz_payload(html_page, os.path.getsize(html_page))
+            raise AssertionError("non-LAZ payload must be rejected")
+        except ValueError:
+            pass
+
+
 def main() -> None:
     validate_skills()
     openstreetmap_smoke()
     overture_smoke()
     pointcloud_terrain_smoke()
+    pointcloud_terrain_guards_smoke()
 
 
 if __name__ == "__main__":

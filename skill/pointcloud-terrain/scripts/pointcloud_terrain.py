@@ -9,6 +9,7 @@ from dcc_mcp_core.skill import skill_entry, skill_exception, skill_success
 
 from _tnm import (
     DEFAULT_ENDPOINT,
+    LAZ_SUFFIX,
     attribution,
     download_tile,
     pick_tile,
@@ -16,6 +17,8 @@ from _tnm import (
     summarize,
     validate_bbox,
 )
+
+LAZ_FORMAT = LAZ_SUFFIX.lstrip(".")
 
 
 def descriptor(
@@ -30,7 +33,7 @@ def descriptor(
         variants=[
             AssetFileVariant(
                 local_path=local_path,
-                format="laz",
+                format=summary["format"] or LAZ_FORMAT,
                 preferred=True,
             )
         ],

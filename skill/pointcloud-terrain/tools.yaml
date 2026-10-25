@@ -23,19 +23,25 @@ tools:
         endpoint: {type: string, format: uri, default: "https://tnmaccess.nationalmap.gov/api/v1/products"}
     output_schema:
       type: object
-      required: [bbox, count, candidates]
+      additionalProperties: true
+      required: [success]
       properties:
-        bbox: {type: array, minItems: 4, maxItems: 4, items: {type: number}}
-        count: {type: integer, minimum: 0}
-        candidates:
-          type: array
-          items:
-            type: object
-            required: [title, source_id, download_url]
-            properties:
-              title: {type: string}
-              source_id: {type: string}
-              download_url: {type: string}
+        success: {type: boolean}
+        message: {type: string}
+        context:
+          type: object
+          properties:
+            bbox: {type: array, minItems: 4, maxItems: 4, items: {type: number}}
+            candidate_count: {type: integer, minimum: 0}
+            candidates:
+              type: array
+              items:
+                type: object
+                required: [title, source_id, download_url]
+                properties:
+                  title: {type: string}
+                  source_id: {type: string}
+                  download_url: {type: string}
 
   - name: download_pointcloud_terrain
     description: Download one bounded USGS 3DEP lidar point cloud tile and return an attributed AssetDescriptor.
@@ -64,19 +70,29 @@ tools:
         endpoint: {type: string, format: uri, default: "https://tnmaccess.nationalmap.gov/api/v1/products"}
     output_schema:
       type: object
-      required: [asset_descriptor]
+      additionalProperties: true
+      required: [success]
       properties:
-        asset_descriptor:
+        success: {type: boolean}
+        message: {type: string}
+        context:
           type: object
-          required: [asset_id, variants, attribution]
           properties:
-            asset_id: {type: string}
-            variants:
-              type: array
-              minItems: 1
-              items:
-                type: object
-                required: [local_path, format]
-            attribution:
+            files: {type: array, items: {type: string}}
+            size_in_bytes: {type: integer, minimum: 0}
+            bbox: {type: array, minItems: 4, maxItems: 4, items: {type: number}}
+            candidate_count: {type: integer, minimum: 0}
+            asset_descriptor:
               type: object
-              required: [source_url, license_spdx, author, attribution_text]
+              required: [asset_id, variants, attribution]
+              properties:
+                asset_id: {type: string}
+                variants:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [local_path, format]
+                attribution:
+                  type: object
+                  required: [source_url, license_spdx, author, attribution_text]

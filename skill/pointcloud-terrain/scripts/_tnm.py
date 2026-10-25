@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
 
 DEFAULT_ENDPOINT = "https://tnmaccess.nationalmap.gov/api/v1/products"
 DATASET = "Lidar Point Cloud (LPC)"
 USER_AGENT = "dcc-mcp-pointcloud-terrain/0.1"
+
+# Both tools take a caller-supplied ``endpoint``, so every request — including
+# each redirect hop — is pinned to the public USGS hosts that publish TNM
+# metadata and 3DEP tiles. Without this pin a caller could aim the skill at an
+# internal HTTPS service and use it as a GET proxy.
+ALLOWED_HOSTS = ("tnmaccess.nationalmap.gov", "rockyweb.usgs.gov")
+ALLOWED_PORTS = (443,)
+
+# Only LAZ payloads are accepted: the LASF signature is why a variant can be
+# published as ``format: laz`` at all.
+LAZ_MAGIC = b"LASF"
+LAZ_SUFFIX = ".laz"
+TEMP_SUFFIX = ".part"
 
 # USGS 3DEP tiles are large, so a single query is capped to keep the candidate
 # list bounded and the download predictable.
@@ -25,6 +39,44 @@ LICENSE_SPDX = "USGS-PD"
 
 class BoundsError(ValueError):
     """Raised when a requested bounding box is unusable for a bounded query."""
+
+
+class UrlNotAllowedError(ValueError):
+    """Raised when a URL leaves the pinned USGS host allowlist."""
+
+
+def ensure_allowed_url(url: str) -> str:
+    """Validate that ``url`` points at an allowlisted USGS host over HTTPS."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise UrlNotAllowedError("USGS requests must use HTTPS, got %r" % (parsed.scheme or url))
+    if parsed.username or parsed.password:
+        raise UrlNotAllowedError("URL credentials are not allowed: %r" % url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host not in ALLOWED_HOSTS:
+        raise UrlNotAllowedError(
+            "Host %r is not an allowed USGS data host (allowed: %s)"
+            % (host, ", ".join(ALLOWED_HOSTS))
+        )
+    if parsed.port is not None and parsed.port not in ALLOWED_PORTS:
+        raise UrlNotAllowedError("Port %r is not allowed for USGS requests" % parsed.port)
+    return url
+
+
+class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the allowlist check on every redirect hop before following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        ensure_allowed_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_allowed_url(url: str, timeout: float, headers: dict = None):
+    """Open ``url`` with the allowlist enforced on the request and every hop."""
+    ensure_allowed_url(url)
+    opener = urllib.request.build_opener(_AllowlistRedirectHandler())
+    request = urllib.request.Request(url, headers=headers or {"User-Agent": USER_AGENT})
+    return opener.open(request, timeout=timeout)
 
 
 def validate_bbox(south: float, west: float, north: float, east: float) -> tuple:
@@ -54,20 +106,18 @@ def build_query_url(
 
 
 def query_candidates(bbox: tuple, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 120.0) -> list:
-    """Return the bounded, deterministic candidate tile list for ``bbox``.
+    """Return the bounded, deterministic LAZ candidate list for ``bbox``.
 
-    The list is sorted by ``(title, sourceId)`` so repeated queries for the same
-    bbox return the same ordering regardless of upstream response order.
+    Only tiles that publish a real ``.laz`` URL are returned, so a chosen tile
+    can always be reported as ``format: laz`` without guessing. The list is
+    sorted by ``(title, sourceId)`` so repeated queries for the same bbox
+    return the same ordering regardless of upstream response order.
     """
-    if urllib.parse.urlparse(endpoint).scheme != "https":
-        raise ValueError("TNM endpoint must use HTTPS")
-    request = urllib.request.Request(
-        build_query_url(bbox, endpoint),
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    url = build_query_url(bbox, ensure_allowed_url(endpoint))
+    with open_allowed_url(url, timeout, headers=request_headers) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    items = payload.get("items") or []
+    items = [item for item in (payload.get("items") or []) if laz_download_url(item)]
     return sorted(
         items,
         key=lambda item: (str(item.get("title") or ""), str(item.get("sourceId") or "")),
@@ -88,17 +138,33 @@ def tile_intersects_bbox(tile: dict, bbox: tuple) -> bool:
     return not (max_x < west or min_x > east or max_y < south or min_y > north)
 
 
+def laz_download_url(tile: dict) -> str:
+    """Return the tile's LAZ download URL, or ``""`` when it publishes none.
+
+    A tile may advertise LAS, GeoPackage, or other products as well. Only a URL
+    whose path really ends in ``.laz`` may be published as ``format: laz``.
+    """
+    urls = tile.get("urls") or {}
+    for candidate in (urls.get("LAZ"), tile.get("downloadURL")):
+        if not candidate:
+            continue
+        if urllib.parse.urlparse(str(candidate)).path.lower().endswith(LAZ_SUFFIX):
+            return str(candidate)
+    return ""
+
+
 def summarize(tile: dict) -> dict:
     """Reduce one TNM item to the fields a caller needs to choose and download."""
     box = tile.get("boundingBox") or {}
     urls = tile.get("urls") or {}
+    download_url = laz_download_url(tile)
     return {
         "title": tile.get("title") or "",
         "source_id": tile.get("sourceId") or "",
-        "format": tile.get("format") or "",
+        "format": LAZ_SUFFIX.lstrip(".") if download_url else "",
         "size_in_bytes": tile.get("sizeInBytes"),
         "publication_date": tile.get("publicationDate") or "",
-        "download_url": tile.get("downloadURL") or urls.get("LAZ") or "",
+        "download_url": download_url,
         "formats": sorted(str(key) for key in urls),
         "bounding_box": {
             "min_x": box.get("minX"),
@@ -127,19 +193,57 @@ def pick_tile(candidates: list, source_id: str = "", index: int = 0) -> dict:
     return candidates[index]
 
 
+def verify_laz_payload(path: str, expected_size: int = None) -> int:
+    """Verify a downloaded payload is a complete LAZ file and return its size."""
+    actual_size = os.path.getsize(path)
+    if expected_size is not None and actual_size != expected_size:
+        raise ValueError(
+            "Truncated download: expected %d bytes, received %d" % (expected_size, actual_size)
+        )
+    with open(path, "rb") as handle:
+        magic = handle.read(len(LAZ_MAGIC))
+    if magic != LAZ_MAGIC:
+        raise ValueError("Downloaded payload is not a LASF/LAZ file")
+    return actual_size
+
+
 def download_tile(url: str, destination: str, chunk_size: int = 1 << 20, timeout: float = 600.0) -> str:
-    """Stream ``url`` to ``destination`` and return the written path."""
-    if urllib.parse.urlparse(url).scheme != "https":
-        raise ValueError("Tile download URL must use HTTPS")
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        with open(destination, "wb") as handle:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                handle.write(chunk)
+    """Stream an allowlisted LAZ tile to ``destination`` and return its path.
+
+    The payload is written to a sidecar ``.part`` file and only moved into place
+    after the byte count matches ``Content-Length`` and the LAZ signature is
+    present, so an early EOF or an HTML error page can never be published as a
+    successful tile.
+    """
+    ensure_allowed_url(url)
+    temp_path = destination + TEMP_SUFFIX
+    try:
+        with open_allowed_url(url, timeout) as response:
+            expected_size = _parse_content_length(response.headers.get("Content-Length"))
+            with open(temp_path, "wb") as handle:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        verify_laz_payload(temp_path, expected_size)
+        os.replace(temp_path, destination)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
     return destination
+
+
+def _parse_content_length(value: Any) -> Optional[int]:
+    """Return ``Content-Length`` as an int, or ``None`` when absent or invalid."""
+    if value is None:
+        return None
+    try:
+        length = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
 
 
 def attribution(title: str = "") -> dict:

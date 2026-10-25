@@ -5,13 +5,14 @@ license: MIT
 compatibility: "dcc-mcp-core 0.19+, Python 3.10+"
 metadata:
   dcc-mcp:
-    version: v0.1.0
+    version: v0.1.1
     dcc: python
     layer: domain
     tags: [asset, geospatial, point-cloud, lidar, usgs, 3dep, terrain]
     search-hint: "USGS 3DEP lidar point cloud, LAZ terrain tiles, Houdini terrain, Unreal landscape point cloud"
     produces: [asset_descriptor]
     tools: tools.yaml
+    groups: groups.yaml
 ---
 
 # Point Cloud Terrain
@@ -35,8 +36,15 @@ skill once per tile.
 
 No API key is required. Both tools work keyless against the public TNM API.
 
+Only LAZ products are listed. A tile that publishes LAS or another format instead is skipped, so
+every candidate can be downloaded and reported honestly as `format: laz`. Requests — including each
+redirect hop — are restricted to the public USGS hosts (`tnmaccess.nationalmap.gov`,
+`rockyweb.usgs.gov`), so a custom `endpoint` pointing anywhere else is rejected rather than fetched.
+
 Individual 3DEP tiles are large, commonly 40-200 MB. `download_pointcloud_terrain` is not
-idempotent: each call writes the tile again.
+idempotent: each call writes the tile again. A download only replaces the target file after the
+byte count matches `Content-Length` and the payload starts with the `LASF` signature, so a truncated
+or non-LAZ response fails instead of being published as a tile.
 
 ## Licensing and attribution
 
