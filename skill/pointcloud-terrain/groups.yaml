@@ -1,0 +1,9 @@
+groups:
+  - name: geospatial
+    description: Bounded USGS 3DEP lidar point cloud discovery and download.
+    # Both tools are the whole skill: keep them visible without an extra
+    # activate_tool_group round trip on every session.
+    default_active: true
+    tools:
+      - search_pointcloud_terrain
+      - download_pointcloud_terrain
